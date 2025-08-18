@@ -204,7 +204,7 @@ def _cluster_horizontal_and_vertical_lines(lines: np.ndarray):
     thetas = lines[..., 1].reshape(-1, 1)
     distance_matrix = pairwise_distances(
         thetas, thetas, metric=_absolute_angle_difference)
-    agg = AgglomerativeClustering(n_clusters=2, affinity="precomputed",
+    agg = AgglomerativeClustering(n_clusters=2, #affinity="precomputed",
                                   linkage="average")
     clusters = agg.fit_predict(distance_matrix)
 

@@ -73,7 +73,7 @@ class ChessRecognizer:
         model_file = next(iter(path.glob("*.pt")))
         yaml_file = next(iter(path.glob("*.yaml")))
         cfg = CN.load_yaml_with_base(yaml_file)
-        model = torch.load(model_file, map_location=DEVICE)
+        model = torch.load(model_file, map_location=DEVICE, weights_only=False)
         model = device(model)
         model.eval()
         return cfg, model
