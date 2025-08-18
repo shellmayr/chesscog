@@ -54,12 +54,12 @@ There are three methods of installing and running chesscog.
    poetry install
    ```
    Note that you need to run `poetry shell` to activate the virtual environment in your shell before running any of the commands later in this README.
-2. **Using pip.**
+2. **Using pip (recommended for Python versions > 3.8)**
    This option will install _chesscog_ locally on your machine using pip (without a virtual environment).
    ```bash
    git clone https://github.com/georg-wolflein/chesscog.git
    cd chesscog
-   pip install .
+   pip install -r requirements.txt
    ```
 3. **Using Docker.**
    Two Dockerfiles are provided: one for CPU (_cpu.Dockerfile_) and another with enabled GPU-acceleration (_Dockerfile_). Simply subsitute the name in the following command.
