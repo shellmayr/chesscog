@@ -38,6 +38,7 @@ from chesscog.piece_classifier import create_dataset as create_piece_dataset
 from chesscog.core import device, DEVICE
 from chesscog.core.dataset import build_transforms, Datasets
 from chesscog.core.dataset import name_to_piece
+from chesscog.core.models import build_model
 
 
 class ChessRecognizer:
@@ -63,20 +64,40 @@ class ChessRecognizer:
             self._occupancy_cfg, mode=Datasets.TEST)
         self._pieces_cfg, self._pieces_model = self._load_classifier(
             classifiers_folder / "piece_classifier")
-        self._pieces_transforms = build_transforms(
-            self._pieces_cfg, mode=Datasets.TEST)
-        self._piece_classes = np.array(list(map(name_to_piece,
-                                                self._pieces_cfg.DATASET.CLASSES)))
+        
+        # Check if piece classifier is YOLO-based
+        self._use_yolo = hasattr(self._pieces_model, 'is_yolo') and self._pieces_model.is_yolo
+        
+        if self._use_yolo:
+            # Load YOLO model with specific path from config
+            if hasattr(self._pieces_cfg.TRAINING.MODEL, 'MODEL_PATH') and self._pieces_cfg.TRAINING.MODEL.MODEL_PATH:
+                self._pieces_model.load_model(self._pieces_cfg.TRAINING.MODEL.MODEL_PATH)
+        else:
+            # Traditional CNN approach
+            self._pieces_transforms = build_transforms(
+                self._pieces_cfg, mode=Datasets.TEST)
+            self._piece_classes = np.array(list(map(name_to_piece,
+                                                    self._pieces_cfg.DATASET.CLASSES)))
 
     @classmethod
     def _load_classifier(cls, path: Path):
-        model_file = next(iter(path.glob("*.pt")))
         yaml_file = next(iter(path.glob("*.yaml")))
         cfg = CN.load_yaml_with_base(yaml_file)
-        model = torch.load(model_file, map_location=DEVICE, weights_only=False)
-        model = device(model)
-        model.eval()
-        return cfg, model
+        
+        # Check if this is a YOLO configuration
+        if hasattr(cfg.TRAINING, 'USE_YOLO') and cfg.TRAINING.USE_YOLO:
+            # Build YOLO model from config
+            model = build_model(cfg)
+            model = device(model)
+            model.eval()
+            return cfg, model
+        else:
+            # Traditional CNN loading
+            model_file = next(iter(path.glob("*.pt")))
+            model = torch.load(model_file, map_location=DEVICE, weights_only=False)
+            model = device(model)
+            model.eval()
+            return cfg, model
 
     def _classify_occupancy(self, img: np.ndarray, turn: chess.Color, corners: np.ndarray) -> np.ndarray:
         warped = create_occupancy_dataset.warp_chessboard_image(
@@ -112,6 +133,21 @@ class ChessRecognizer:
         all_pieces[occupancy] = pieces
         return all_pieces
 
+    def _classify_pieces_yolo(self, img: np.ndarray, turn: chess.Color, corners: np.ndarray) -> np.ndarray:
+        """Classify pieces using YOLO detection."""
+        from chesscog.piece_classifier.yolo_utils import detect_pieces_with_yolo
+        
+        # Get YOLO configuration parameters
+        confidence_threshold = getattr(self._pieces_cfg.YOLO, 'CONFIDENCE_THRESHOLD', 0.5)
+        iou_threshold = getattr(self._pieces_cfg.YOLO, 'IOU_THRESHOLD', 0.4)
+        
+        # Run YOLO detection
+        pieces_array, raw_detections = detect_pieces_with_yolo(
+            self._pieces_model, img, corners, confidence_threshold, iou_threshold
+        )
+        
+        return pieces_array
+
     def predict(self, img: np.ndarray, turn: chess.Color = chess.WHITE) -> typing.Tuple[chess.Board, np.ndarray]:
         """Perform an inference.
 
@@ -125,8 +161,14 @@ class ChessRecognizer:
         with torch.no_grad():
             img, img_scale = resize_image(self._corner_detection_cfg, img)
             corners = find_corners(self._corner_detection_cfg, img)
-            occupancy = self._classify_occupancy(img, turn, corners)
-            pieces = self._classify_pieces(img, turn, corners, occupancy)
+            
+            if self._use_yolo:
+                # YOLO-based piece detection (no occupancy classification needed)
+                pieces = self._classify_pieces_yolo(img, turn, corners)
+            else:
+                # Traditional CNN approach
+                occupancy = self._classify_occupancy(img, turn, corners)
+                pieces = self._classify_pieces(img, turn, corners, occupancy)
 
             board = chess.Board()
             board.clear_board()
@@ -158,10 +200,30 @@ class TimedChessRecognizer(ChessRecognizer):
             img, img_scale = resize_image(self._corner_detection_cfg, img)
             corners = find_corners(self._corner_detection_cfg, img)
             t2 = timer()
-            occupancy = self._classify_occupancy(img, turn, corners)
-            t3 = timer()
-            pieces = self._classify_pieces(img, turn, corners, occupancy)
-            t4 = timer()
+            
+            if self._use_yolo:
+                # YOLO-based piece detection
+                pieces = self._classify_pieces_yolo(img, turn, corners)
+                t3 = timer()
+                t4 = t3  # No separate occupancy step for YOLO
+                times = {
+                    "corner_detection": t2-t1,
+                    "occupancy_classification": 0,  # YOLO does this implicitly
+                    "piece_classification": t3-t2,
+                    "prepare_results": 0
+                }
+            else:
+                # Traditional CNN approach
+                occupancy = self._classify_occupancy(img, turn, corners)
+                t3 = timer()
+                pieces = self._classify_pieces(img, turn, corners, occupancy)
+                t4 = timer()
+                times = {
+                    "corner_detection": t2-t1,
+                    "occupancy_classification": t3-t2,
+                    "piece_classification": t4-t3,
+                    "prepare_results": 0
+                }
 
             board = chess.Board()
             board.clear()
@@ -171,13 +233,8 @@ class TimedChessRecognizer(ChessRecognizer):
                     board.set_piece_at(square, piece)
             corners = corners / img_scale
             t5 = timer()
-
-            times = {
-                "corner_detection": t2-t1,
-                "occupancy_classification": t3-t2,
-                "piece_classification": t4-t3,
-                "prepare_results": t5-t4
-            }
+            
+            times["prepare_results"] = t5-t4
 
             return board, corners, times
 

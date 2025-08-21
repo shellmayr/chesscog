@@ -4,8 +4,7 @@
 from torch import nn
 from torchvision import models
 import torch.nn.functional as F
-import functools
-from recap import CfgNode as CN
+import torch
 
 from chesscog.core.registry import Registry
 from chesscog.core.models import MODELS_REGISTRY
@@ -164,4 +163,107 @@ class InceptionV3(nn.Module):
         }
 
     def forward(self, x):
+        return self.model(x)
+
+
+@MODEL_REGISTRY.register
+class YOLOv5(nn.Module):
+    """YOLO v5 model for chess piece detection.
+    
+    This model wrapper integrates YOLOv5 for direct piece detection on chess boards.
+    Instead of classifying individual squares, it performs object detection on the full image.
+    """
+    
+    input_size = 640, 640
+    pretrained = False
+    is_yolo = True
+    
+    def __init__(self, model_path: str = None):
+        super().__init__()
+        self.model_path = model_path
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    def load_model(self, model_path: str):
+        """Load a YOLOv5 model from a file path."""
+        try:
+            import yolov5
+            self.model = yolov5.load(model_path)
+            self.model.to(self.device)
+        except ImportError:
+            try:
+                self.model = torch.hub.load('ultralytics/yolov5', 'custom', path=model_path)
+                self.model.to(self.device)
+            except Exception as e:
+                raise ImportError(f"Could not load YOLOv5 model. Install ultralytics yolov5: pip install yolov5. Error: {e}")
+    
+    def forward(self, x):
+        if self.model is None:
+            raise ValueError("Model not loaded. Call load_model() first.")
+        return self.model(x)
+
+
+@MODEL_REGISTRY.register  
+class YOLOv8(nn.Module):
+    """YOLO v8 model for chess piece detection.
+    
+    This model wrapper integrates YOLOv8 for direct piece detection on chess boards.
+    Instead of classifying individual squares, it performs object detection on the full image.
+    """
+    
+    input_size = 640, 640
+    pretrained = False
+    is_yolo = True
+    
+    def __init__(self, model_path: str = None):
+        super().__init__()
+        self.model_path = model_path
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    def load_model(self, model_path: str):
+        """Load a YOLOv8 model from a file path."""
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO(model_path)
+            self.model.to(self.device)
+        except ImportError as e:
+            raise ImportError(f"Could not load YOLOv8 model. Install ultralytics: pip install ultralytics. Error: {e}")
+    
+    def forward(self, x):
+        if self.model is None:
+            raise ValueError("Model not loaded. Call load_model() first.")
+        return self.model(x)
+
+
+@MODEL_REGISTRY.register
+class CustomYOLO(nn.Module):
+    """Custom YOLO model wrapper for chess piece detection.
+    
+    This is a flexible wrapper that can load any PyTorch YOLO model
+    for chess piece detection.
+    """
+    
+    input_size = 640, 640
+    pretrained = False  
+    is_yolo = True
+    
+    def __init__(self, model_path: str = None):
+        super().__init__()
+        self.model_path = model_path
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    def load_model(self, model_path: str):
+        """Load a custom PyTorch YOLO model from a file path."""
+        try:
+            self.model = torch.load(model_path, map_location=self.device, weights_only=False)
+            self.model.eval()
+            self.model.to(self.device)
+        except Exception as e:
+            raise ValueError(f"Could not load custom YOLO model from {model_path}. Error: {e}")
+    
+    def forward(self, x):
+        if self.model is None:
+            raise ValueError("Model not loaded. Call load_model() first.")
         return self.model(x)

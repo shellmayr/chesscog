@@ -29,7 +29,7 @@ def _train_model(model_type: str) -> typing.Tuple[torch.nn.Module, CN]:
         model_type / f"{model_file.stem}.yaml"
     cfg = CN.load_yaml_with_base(yaml_file)
     run_dir = URI("runs://transfer_learning") / model_type
-    model = torch.load(model_file, map_location=DEVICE)
+    model = torch.load(model_file, map_location=DEVICE, weights_only=False)
     model = device(model)
     is_inception = "inception" in model_file.stem.lower()
     train_model(cfg, run_dir, model, is_inception,
