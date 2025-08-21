@@ -30,6 +30,8 @@ MQTT_URL=your_mqtt_broker_url
 MQTT_USERNAME=your_username
 MQTT_PASSWORD=your_password  
 MQTT_TOPIC=your_topic
+# Board rotation for camera orientation  
+ROTATE_BOARD_270=true  # Actually applies 180° rotation
 # ... other MQTT settings
 ```
 
@@ -75,6 +77,69 @@ When an image is received via MQTT:
 5. **Multiple Views**: Displays original, corner detection, and board state
 6. **Robust Error Handling**: Graceful fallback when no chess board is detected
 7. **Smart Detection**: Distinguishes between "no board found" vs "processing errors"
+8. **Adaptive Parameters**: Automatically tries different detection parameters for various cameras
+9. **Camera Compatibility**: Works with different image sizes, lighting, and camera characteristics
+10. **Original Image YOLO**: Uses full-resolution original images for YOLO detection (better accuracy)
+11. **Professional Board Rendering**: Uses chess.svg for beautiful, standard chess board visualization
+
+### Adaptive Corner Detection
+
+The webapp includes an intelligent parameter adjustment system that automatically tries different corner detection settings when the default parameters fail. This solves the common "RANSAC produced no viable results" error with different cameras.
+
+**Parameter Sets Automatically Tested:**
+1. **Default Parameters**: Standard settings for most cameras
+2. **High Sensitivity**: For low-contrast or dim images (lower thresholds)
+3. **Low Sensitivity**: For noisy or high-contrast images (higher thresholds)  
+4. **Maximum Relaxed**: Last resort with very permissive settings
+
+**Benefits:**
+- **Multi-Camera Support**: Works with different camera sensors and lenses
+- **Lighting Adaptation**: Handles various lighting conditions automatically
+- **Resolution Independence**: Adapts to different image sizes (1600x1200, etc.)
+- **Real-time Feedback**: Shows which parameter set was successful
+
+### Original Image YOLO Detection
+
+For YOLO-based piece recognition, the webapp uses the **"Use Original Image"** approach instead of warped images:
+
+**Benefits:**
+- **Higher Resolution**: Uses full camera resolution (e.g., 1200x1600) instead of downscaled warped images
+- **Better Accuracy**: More detailed piece features for improved recognition
+- **No Warping Artifacts**: Avoids distortion from perspective correction
+- **More Detections**: Typically finds 2-3x more pieces than warped approach
+
+**Technical Details:**
+- Detects corners on resized image for efficiency
+- Scales corners back to original image coordinates
+- Runs YOLO detection on full-resolution original image
+- **Uses perspective transformation** to map detections to chess squares accurately
+- **Corner-based mapping** instead of flawed auto-detection from piece positions
+- **Automatic 180° rotation** for camera orientation
+- Inspired by approaches from [chess_state_recognition](https://github.com/sta314/chess_state_recognition#) project
+
+### Board Rotation for Camera Orientation
+
+The webapp automatically rotates the detected board state by **180°** to match camera orientations.
+
+**Configuration:**
+```env
+ROTATE_BOARD_270=true   # Enable 180° rotation (default)
+ROTATE_BOARD_270=false  # Disable rotation
+```
+
+**How it works:**
+- **Original Detection**: YOLO detects pieces based on camera perspective
+- **Perspective Mapping**: Maps pieces to chess squares using corner detection
+- **180° Rotation**: Rotates the entire board state to match logical chess orientation
+- **Final FEN**: Outputs the rotated board state for correct chess notation
+
+**Rotation Formula:** `(file, rank) → (7-file, 7-rank)`
+- Example: Queen at g1 → Queen at b8 after rotation
+
+**UI Indicators:**
+- **Activity Feed**: Shows "(180° rotated)" in detection messages
+- **Info Overlay**: Displays "🔄 Rotated 180° for camera" status  
+- **Analysis Panel**: Shows both rotated and original FEN for debugging
 
 ### Testing with Sample Messages
 
@@ -131,6 +196,7 @@ This will send various test messages including:
 - `GET /events` - Server-Sent Events stream for real-time updates
 - `GET /status` - JSON endpoint with connection status and statistics
 - `GET /messages` - JSON endpoint with recent message history
+- `POST /test_image` - Test image recognition with adaptive parameters (for debugging camera issues)
 
 ## Troubleshooting
 
