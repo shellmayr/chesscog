@@ -11,6 +11,7 @@ import numpy as np
 import cv2
 import chess
 import torch
+from typing import List, Dict
 from PIL import Image
 from flask import Flask, request, jsonify, render_template_string
 from pathlib import Path
@@ -24,6 +25,17 @@ from chesscog.core import device, sort_corner_points
 from chesscog.core.dataset import build_transforms, Datasets, name_to_piece
 from chesscog.core.exceptions import ChessboardNotLocatedException
 from recap import URI, CfgNode as CN
+
+# Chess board SVG generation
+try:
+    import chess.svg
+    import cairosvg
+    CHESS_SVG_AVAILABLE = True
+    print("✅ chess.svg and cairosvg loaded successfully")
+except ImportError as e:
+    CHESS_SVG_AVAILABLE = False
+    print(f"⚠️ chess.svg/cairosvg not available: {e}")
+    print("Will use basic board visualization")
 
 app = Flask(__name__)
 
@@ -80,6 +92,87 @@ class DebuggingChessRecognizer(ChessRecognizer):
                     })
                 except ChessboardNotLocatedException as e:
                     debug_info['error'] = f"Corner detection failed: {str(e)}"
+                    
+                    # If using YOLO, we can still try piece detection without corners
+                    if self._use_yolo:
+                        debug_info['steps'].append({
+                            'name': '2. Corner Detection Failed',
+                            'description': f'No corners detected, but attempting YOLO piece detection',
+                            'image': self._encode_image(img_resized),
+                            'metadata': {'error': str(e), 'fallback_mode': True}
+                        })
+                        
+                        # Try YOLO without corners - use entire image
+                        try:
+                            debug_info['steps'].append({
+                                'name': '3. YOLO Detection (Fallback Mode)',
+                                'description': 'YOLO piece detection without board boundaries',
+                                'image': self._encode_image(original_img),
+                                'metadata': {'approach': 'yolo_fallback', 'no_corners': True}
+                            })
+                            
+                            # Run YOLO on entire original image without corner constraints
+                            pieces, raw_detections = self._classify_pieces_yolo_fallback(
+                                original_img, turn, custom_conf_threshold, custom_iou_threshold)
+                            
+                            # Store raw detections for analysis
+                            debug_info['yolo_raw_detections'] = raw_detections
+                            
+                            # Convert numpy arrays to lists for JSON serialization
+                            serializable_detections = []
+                            for detection in raw_detections:
+                                det_copy = detection.copy()
+                                if 'bbox' in det_copy and hasattr(det_copy['bbox'], 'tolist'):
+                                    det_copy['bbox'] = det_copy['bbox'].tolist()
+                                elif 'bbox' in det_copy and isinstance(det_copy['bbox'], (list, tuple)):
+                                    det_copy['bbox'] = [float(x) for x in det_copy['bbox']]
+                                det_copy['confidence'] = float(det_copy['confidence'])
+                                det_copy['class'] = int(det_copy['class'])
+                                serializable_detections.append(det_copy)
+                            
+                            # Create visualization without board mapping
+                            fallback_viz = self._visualize_yolo_fallback_results(original_img, raw_detections)
+                            debug_info['steps'].append({
+                                'name': '4. YOLO Fallback Detection Results',
+                                'description': f'YOLO found {len(raw_detections)} pieces without board boundaries',
+                                'image': self._encode_image(fallback_viz),
+                                'metadata': {
+                                    'num_raw_detections': len(raw_detections),
+                                    'confidence_threshold': float(custom_conf_threshold or getattr(self._pieces_cfg.YOLO, 'CONFIDENCE_THRESHOLD', 0.5)),
+                                    'iou_threshold': float(custom_iou_threshold or getattr(self._pieces_cfg.YOLO, 'IOU_THRESHOLD', 0.4)),
+                                    'approach': 'Fallback Mode',
+                                    'raw_detections': serializable_detections,
+                                    'fallback_mode': True
+                                }
+                            })
+                            
+                            # Create a simple list of detected pieces
+                            piece_list = []
+                            for detection in raw_detections:
+                                class_names = [
+                                    "black_bishop", "black_king", "black_knight", "black_pawn", "black_queen", "black_rook",
+                                    "white_bishop", "white_king", "white_knight", "white_pawn", "white_queen", "white_rook"
+                                ]
+                                class_id = detection['class']
+                                if class_id < len(class_names):
+                                    piece_name = class_names[class_id]
+                                    confidence = detection['confidence']
+                                    piece_list.append(f"{piece_name} ({confidence:.2f})")
+                            
+                            debug_info['fallback_pieces'] = piece_list
+                            debug_info['final_board'] = None  # No board state without corners
+                            debug_info['final_corners'] = None
+                            
+                            return make_json_serializable(debug_info)
+                            
+                        except Exception as yolo_e:
+                            debug_info['steps'].append({
+                                'name': '4. YOLO Fallback Failed',
+                                'description': f'YOLO fallback also failed: {str(yolo_e)}',
+                                'image': self._encode_image(original_img),
+                                'metadata': {'yolo_error': str(yolo_e)}
+                            })
+                    
                     return debug_info
                 
                 # Step 3: Image warping
@@ -178,15 +271,22 @@ class DebuggingChessRecognizer(ChessRecognizer):
                         }
                     })
                     
-                    # Add clean final board visualization
-                    clean_board_viz = self._visualize_clean_final_board(pieces)
+                    # Add clean final board visualization using FEN
+                    board = chess.Board()
+                    board.clear_board()
+                    for square, piece in zip(self._squares, pieces):
+                        if piece:
+                            board.set_piece_at(square, piece)
+                    
+                    clean_board_viz = self._visualize_clean_final_board(pieces, board.fen())
                     debug_info['steps'].append({
                         'name': '4d. Final Board State',
                         'description': f'Clean chess board visualization with {np.count_nonzero(pieces != None)} pieces',
                         'image': self._encode_image(clean_board_viz),
                         'metadata': {
                             'num_pieces': int(np.count_nonzero(pieces != None)),
-                            'visualization_type': 'clean_board'
+                            'visualization_type': 'chess.svg' if CHESS_SVG_AVAILABLE else 'custom',
+                            'fen': board.fen()
                         }
                     })
                 else:
@@ -424,9 +524,36 @@ class DebuggingChessRecognizer(ChessRecognizer):
         
         return viz
     
-    def _visualize_clean_final_board(self, pieces):
-        """Create a clean visualization of the final board state."""
-        # Create a chess board visualization
+    def _visualize_clean_final_board(self, pieces, fen=None):
+        """Create a clean visualization of the final board state using chess.svg."""
+        if CHESS_SVG_AVAILABLE and fen:
+            try:
+                # Use chess.svg to generate a proper chess board
+                print(f"🎨 Generating board image from FEN: {fen}")
+                
+                # Create chess board from FEN
+                board = chess.Board(fen)
+                
+                # Generate SVG
+                svg_data = chess.svg.board(board, size=600)
+                
+                # Convert SVG to PNG using cairosvg
+                png_data = cairosvg.svg2png(bytestring=svg_data.encode('utf-8'))
+                
+                # Convert PNG bytes to OpenCV format
+                nparr = np.frombuffer(png_data, np.uint8)
+                board_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                print(f"✅ Generated board image using chess.svg: {board_img.shape}")
+                return board_img
+                
+            except Exception as e:
+                print(f"❌ chess.svg failed: {e}, falling back to custom visualization")
+                # Fall back to custom visualization
+                pass
+        
+        # Fallback: Custom visualization (original code)
+        print("🎨 Using custom board visualization")
         canvas_size = 600
         canvas = np.ones((canvas_size, canvas_size, 3), dtype=np.uint8) * 255
         square_size = canvas_size // 8
@@ -453,33 +580,35 @@ class DebuggingChessRecognizer(ChessRecognizer):
             cv2.putText(canvas, rank_label, (10, i * square_size + square_size//2 + 8), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
         
-        # Draw pieces with nice Unicode symbols
-        piece_symbols = {
-            'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
-            'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'
-        }
-        
-        for i, piece in enumerate(pieces):
-            if piece is not None:
-                rank = 7 - (i // 8)
-                file = i % 8
-                
-                x = file * square_size + square_size // 2
-                y = rank * square_size + square_size // 2
-                
-                symbol = piece.symbol()
-                unicode_symbol = piece_symbols.get(symbol, symbol)
-                
-                # Use different colors for white/black pieces
-                color = (50, 50, 50) if symbol.isupper() else (150, 50, 50)
-                
-                # Draw the piece with good visibility
-                cv2.putText(canvas, unicode_symbol, (x - 25, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 4)
-        
-        # Add title
-        num_pieces = np.count_nonzero(pieces != None)
-        title = f"Final Chess Board ({num_pieces} pieces)"
-        cv2.putText(canvas, title, (canvas_size//2 - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+        # Only draw pieces if we have the pieces array (for fallback case)
+        if pieces is not None:
+            # Draw pieces with nice Unicode symbols
+            piece_symbols = {
+                'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
+                'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'
+            }
+            
+            for i, piece in enumerate(pieces):
+                if piece is not None:
+                    rank = 7 - (i // 8)
+                    file = i % 8
+                    
+                    x = file * square_size + square_size // 2
+                    y = rank * square_size + square_size // 2
+                    
+                    symbol = piece.symbol()
+                    unicode_symbol = piece_symbols.get(symbol, symbol)
+                    
+                    # Use different colors for white/black pieces
+                    color = (50, 50, 50) if symbol.isupper() else (150, 50, 50)
+                    
+                    # Draw the piece with good visibility
+                    cv2.putText(canvas, unicode_symbol, (x - 25, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 2.5, color, 4)
+            
+            # Add title
+            num_pieces = np.count_nonzero(pieces != None)
+            title = f"Final Chess Board ({num_pieces} pieces)"
+            cv2.putText(canvas, title, (canvas_size//2 - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
         
         return canvas
     
@@ -515,6 +644,154 @@ class DebuggingChessRecognizer(ChessRecognizer):
                 detection['class_name'] = class_names[class_id]
         
         return pieces_array, raw_detections
+
+    def _classify_pieces_yolo_fallback(self, img: np.ndarray, turn: chess.Color, 
+                                      custom_conf_threshold=None, custom_iou_threshold=None):
+        """Run YOLO detection without corner constraints for fallback mode."""
+        
+        # Get YOLO configuration parameters with custom overrides
+        confidence_threshold = custom_conf_threshold or 0.5  # Explicitly set to 50%
+        iou_threshold = custom_iou_threshold or getattr(self._pieces_cfg.YOLO, 'IOU_THRESHOLD', 0.4)
+        
+        print(f"🎯 Using YOLO confidence threshold: {confidence_threshold * 100}%")
+        
+        # Get YOLO model
+        if hasattr(self._pieces_model, 'model') and self._pieces_model.model is not None:
+            yolo_model = self._pieces_model.model
+        else:
+            yolo_model = self._pieces_model
+        
+        # Run YOLO directly on original image without any corner constraints
+        try:
+            # YOLOv8 ultralytics
+            results = yolo_model.predict(img, conf=confidence_threshold, iou=iou_threshold)
+            detections = self._parse_ultralytics_results(results[0])
+        except Exception:
+            try:
+                # YOLOv5 format
+                results = yolo_model(img, size=640)
+                detections = self._parse_yolov5_results(results)
+            except Exception:
+                # Custom model - assume it returns tensor
+                results = yolo_model(torch.from_numpy(img).permute(2, 0, 1).float().unsqueeze(0))
+                detections = self._parse_custom_results(results, confidence_threshold)
+        
+        # Add class names to raw detections for better display
+        class_names = [
+            "black_bishop", "black_king", "black_knight", "black_pawn", "black_queen", "black_rook",
+            "white_bishop", "white_king", "white_knight", "white_pawn", "white_queen", "white_rook"
+        ]
+        for detection in detections:
+            class_id = detection['class']
+            if class_id < len(class_names):
+                detection['class_name'] = class_names[class_id]
+        
+        # Return empty pieces array since we can't map to board without corners
+        pieces_array = np.full(64, None, dtype=object)
+        
+        return pieces_array, detections
+    
+    def _parse_ultralytics_results(self, results) -> List[Dict]:
+        """Parse YOLOv8 ultralytics results."""
+        detections = []
+        
+        if results.boxes is not None:
+            boxes = results.boxes.xyxy.cpu().numpy()
+            scores = results.boxes.conf.cpu().numpy()
+            classes = results.boxes.cls.cpu().numpy().astype(int)
+            
+            for i in range(len(boxes)):
+                detections.append({
+                    'bbox': boxes[i],  # [x1, y1, x2, y2]
+                    'confidence': scores[i],
+                    'class': classes[i]
+                })
+        
+        return detections
+    
+    def _parse_yolov5_results(self, results) -> List[Dict]:
+        """Parse YOLOv5 results."""
+        detections = []
+        
+        for detection in results.xyxy[0].cpu().numpy():
+            x1, y1, x2, y2, conf, cls = detection
+            detections.append({
+                'bbox': [x1, y1, x2, y2],
+                'confidence': conf,
+                'class': int(cls)
+            })
+        
+        return detections
+    
+    def _parse_custom_results(self, results: torch.Tensor, confidence_threshold: float) -> List[Dict]:
+        """Parse custom model results."""
+        detections = []
+        
+        if len(results.shape) == 3:
+            results = results[0]  # Remove batch dimension
+        
+        # Filter by confidence
+        confident_detections = results[results[:, 4] > confidence_threshold]
+        
+        for detection in confident_detections:
+            x_center, y_center, width, height, conf, cls = detection[:6]
+            
+            # Convert from center format to corner format
+            x1 = float(x_center - width / 2)
+            y1 = float(y_center - height / 2) 
+            x2 = float(x_center + width / 2)
+            y2 = float(y_center + height / 2)
+            
+            detections.append({
+                'bbox': [x1, y1, x2, y2],
+                'confidence': float(conf),
+                'class': int(cls)
+            })
+        
+        return detections
+
+    def _visualize_yolo_fallback_results(self, img, raw_detections):
+        """Visualize YOLO detection results without board mapping."""
+        viz = img.copy()
+        
+        class_names = [
+            "black_bishop", "black_king", "black_knight", "black_pawn", "black_queen", "black_rook",
+            "white_bishop", "white_king", "white_knight", "white_pawn", "white_queen", "white_rook"
+        ]
+        
+        colors = [
+            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255),
+            (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0), (128, 0, 128), (0, 128, 128)
+        ]
+        
+        for detection in raw_detections:
+            bbox = detection['bbox']
+            confidence = detection['confidence']
+            class_id = detection['class']
+            
+            if class_id < len(class_names):
+                x1, y1, x2, y2 = [int(coord) for coord in bbox]
+                
+                # Draw bounding box
+                color = colors[class_id % len(colors)]
+                cv2.rectangle(viz, (x1, y1), (x2, y2), color, 3)
+                
+                # Draw label with confidence
+                piece_name = class_names[class_id]
+                label = f"{piece_name}: {confidence:.2f}"
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(viz, (x1, y1 - label_size[1] - 10), 
+                            (x1 + label_size[0], y1), color, -1)
+                cv2.putText(viz, label, (x1, y1 - 5), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Add title
+        cv2.putText(viz, f"YOLO Fallback: {len(raw_detections)} pieces detected", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(viz, "(No board boundaries detected)", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        return viz
 
     def _visualize_yolo_results(self, img, corners, pieces, raw_detections=None, approach_name="Unknown"):
         """Visualize YOLO detection results with bounding boxes."""
@@ -985,6 +1262,19 @@ HTML_TEMPLATE = '''
                         <p><strong>FEN:</strong> ${data.final_board}</p>
                         ${data.board_unicode ? `<div class="chess-board">${data.board_unicode}</div>` : ''}
                         ${data.final_corners ? `<div class="metadata">Corners: ${JSON.stringify(data.final_corners, null, 2)}</div>` : ''}
+                    </div>
+                `;
+            } else if (data.fallback_pieces && data.fallback_pieces.length > 0) {
+                // Show fallback results when corners failed but YOLO detected pieces
+                html += `
+                    <div class="final-result" style="background: #fff3cd; border-color: #ffc107;">
+                        <h3>YOLO Fallback Results</h3>
+                        <p><strong>Status:</strong> Board boundaries not detected, but YOLO found ${data.fallback_pieces.length} pieces</p>
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 10px 0;">
+                            <strong>Detected Pieces:</strong><br>
+                            ${data.fallback_pieces.map(piece => `<span style="display: inline-block; background: #e9ecef; padding: 4px 8px; margin: 2px; border-radius: 3px; font-size: 12px;">${piece}</span>`).join('')}
+                        </div>
+                        <p><em>Note: Pieces detected but cannot determine board position without corner detection.</em></p>
                     </div>
                 `;
             }

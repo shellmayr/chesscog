@@ -20,7 +20,7 @@ import numpy as np
 import cv2
 import chess
 import torch
-from flask import Flask, render_template_string, Response, jsonify
+from flask import Flask, render_template_string, Response, jsonify, request
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
 
@@ -35,6 +35,17 @@ except ImportError as e:
     CHESS_RECOGNITION_AVAILABLE = False
     print(f"⚠️ Chess recognition not available: {e}")
     print("Images will be displayed without recognition analysis")
+
+# Chess board SVG generation
+try:
+    import chess.svg
+    import cairosvg
+    CHESS_SVG_AVAILABLE = True
+    print("✅ chess.svg and cairosvg loaded successfully")
+except ImportError as e:
+    CHESS_SVG_AVAILABLE = False
+    print(f"⚠️ chess.svg/cairosvg not available: {e}")
+    print("Will use basic board visualization")
 
 load_dotenv()
 
@@ -64,12 +75,221 @@ class MQTTChessRecognizer:
         
         if CHESS_RECOGNITION_AVAILABLE:
             try:
-                self.recognizer = ChessRecognizer()
+                # Create debugging chess recognizer with same capabilities as debug webapp
+                self.recognizer = self._create_debugging_recognizer()
                 self.available = True
                 print("✅ Chess recognizer initialized successfully")
+                
+                # Check if YOLO is being used
+                if hasattr(self.recognizer, '_use_yolo') and self.recognizer._use_yolo:
+                    print("🎯 YOLO mode detected - will use original image approach")
+                else:
+                    print("🧠 CNN mode detected - will use standard approach")
+                    
             except Exception as e:
                 print(f"❌ Failed to initialize chess recognizer: {e}")
                 self.available = False
+    
+    def _create_debugging_recognizer(self):
+        """Create a debugging chess recognizer with the same capabilities as debug webapp."""
+        class MQTTDebuggingChessRecognizer(ChessRecognizer):
+            def predict_simple(self, img, turn=chess.WHITE, use_original_image=True):
+                """Simple prediction method that always uses original image for YOLO."""
+                with torch.no_grad():
+                    if self._use_yolo:
+                        # Always use original image approach for YOLO
+                        original_img = img.copy()
+                        img_resized, img_scale = resize_image(self._corner_detection_cfg, img)
+                        corners = find_corners(self._corner_detection_cfg, img_resized)
+                        
+                        # Scale corners back to original image
+                        final_corners = corners / img_scale
+                        
+                        # Run YOLO on original image with proper corner-based mapping
+                        
+                        # First get YOLO detections
+                        if hasattr(self._pieces_model, 'model') and self._pieces_model.model is not None:
+                            yolo_model = self._pieces_model.model
+                        else:
+                            yolo_model = self._pieces_model
+                        
+                        # Run YOLO directly on original image
+                        try:
+                            results = yolo_model.predict(original_img, conf=0.5, iou=0.4)
+                            # Parse results manually since imports are complex
+                            raw_detections = []
+                            if results[0].boxes is not None:
+                                boxes = results[0].boxes.xyxy.cpu().numpy()
+                                scores = results[0].boxes.conf.cpu().numpy()
+                                classes = results[0].boxes.cls.cpu().numpy().astype(int)
+                                
+                                for i in range(len(boxes)):
+                                    raw_detections.append({
+                                        'bbox': boxes[i],
+                                        'confidence': scores[i],
+                                        'class': classes[i]
+                                    })
+                        except Exception as e:
+                            print(f"❌ YOLO detection failed: {e}")
+                            raw_detections = []
+                        
+                        print(f"📊 YOLO found {len(raw_detections)} raw detections on original image")
+                        
+                        # Use proper corner-based mapping with perspective transform
+                        print(f"📐 Using corner-based perspective mapping with corners: {final_corners}")
+                        pieces_array = self._map_detections_to_board_corners(raw_detections, final_corners, original_img.shape[:2])
+                        print(f"📋 Successfully mapped {np.count_nonzero(pieces_array is not None)} pieces to board squares")
+                        
+                        # Store raw detections for visualization
+                        self._last_raw_detections = raw_detections
+                        
+                        # Create board from pieces
+                        board = chess.Board()
+                        board.clear_board()
+                        for square, piece in zip(self._squares, pieces_array):
+                            if piece:
+                                board.set_piece_at(square, piece)
+                        
+                        return board, final_corners
+                    else:
+                        # Use standard predict for CNN
+                        return self.predict(img, turn)
+            
+            def _map_detections_to_board_corners(self, detections, corners, image_shape):
+                """Map YOLO detections to chess board squares using corner-based perspective transform."""
+                pieces_array = np.full(64, None, dtype=object)
+                
+                if not detections or corners is None:
+                    return pieces_array
+                
+                # Define class names
+                class_names = [
+                    "black_bishop", "black_king", "black_knight", "black_pawn", "black_queen", "black_rook",
+                    "white_bishop", "white_king", "white_knight", "white_pawn", "white_queen", "white_rook"
+                ]
+                
+                # Sort corners to ensure consistent ordering: top-left, top-right, bottom-right, bottom-left
+                corners_sorted = self._sort_corners_for_perspective(corners)
+                
+                # Define the standard board coordinate system (8x8 grid)
+                board_corners = np.array([
+                    [0, 0],  # top-left
+                    [8, 0],  # top-right  
+                    [8, 8],  # bottom-right
+                    [0, 8]   # bottom-left
+                ], dtype=np.float32)
+                
+                # Create perspective transformation matrix
+                transform_matrix = cv2.getPerspectiveTransform(corners_sorted.astype(np.float32), board_corners)
+                
+                print("📐 Corner-based board boundaries:")
+                print(f"  Top-left: {corners_sorted[0]}")
+                print(f"  Top-right: {corners_sorted[1]}")
+                print(f"  Bottom-right: {corners_sorted[2]}")
+                print(f"  Bottom-left: {corners_sorted[3]}")
+                
+                # Map each detection to a board square using perspective transform
+                for detection in detections:
+                    class_id = detection['class']
+                    if class_id >= len(class_names):
+                        continue
+                        
+                    piece_name = class_names[class_id]
+                    # Create piece object manually (avoiding import issues)
+                    piece_type_map = {
+                        'black_bishop': chess.Piece(chess.BISHOP, chess.BLACK),
+                        'black_king': chess.Piece(chess.KING, chess.BLACK),
+                        'black_knight': chess.Piece(chess.KNIGHT, chess.BLACK),
+                        'black_pawn': chess.Piece(chess.PAWN, chess.BLACK),
+                        'black_queen': chess.Piece(chess.QUEEN, chess.BLACK),
+                        'black_rook': chess.Piece(chess.ROOK, chess.BLACK),
+                        'white_bishop': chess.Piece(chess.BISHOP, chess.WHITE),
+                        'white_king': chess.Piece(chess.KING, chess.WHITE),
+                        'white_knight': chess.Piece(chess.KNIGHT, chess.WHITE),
+                        'white_pawn': chess.Piece(chess.PAWN, chess.WHITE),
+                        'white_queen': chess.Piece(chess.QUEEN, chess.WHITE),
+                        'white_rook': chess.Piece(chess.ROOK, chess.WHITE)
+                    }
+                    
+                    if piece_name not in piece_type_map:
+                        continue
+                        
+                    piece = piece_type_map[piece_name]
+                    
+                    # Get piece position (use bottom center of bounding box)
+                    bbox = detection['bbox']
+                    center_x = (bbox[0] + bbox[2]) / 2  # Horizontal center
+                    center_y = bbox[3]  # Bottom edge (where piece sits on board)
+                    
+                    # Transform to board coordinates using perspective transform
+                    original_point = np.array([[[center_x, center_y]]], dtype=np.float32)
+                    board_point = cv2.perspectiveTransform(original_point, transform_matrix)[0][0]
+                    
+                    board_x = board_point[0]
+                    board_y = board_point[1]
+                    
+                    print(f"📍 {piece_name} at image ({center_x:.0f}, {center_y:.0f}) → board ({board_x:.2f}, {board_y:.2f})")
+                    
+                    # Skip detections outside the board
+                    if board_x < 0 or board_x > 8 or board_y < 0 or board_y > 8:
+                        print(f"⚠️ REJECTED {piece_name} - outside board at ({board_x:.2f}, {board_y:.2f})")
+                        continue
+                    
+                    # Convert to chess square index
+                    file = int(board_x)  # 0-7 (a-h)
+                    rank = int(board_y)  # 0-7 (1-8, but inverted in image coordinates)
+                    
+                    # Clamp to valid range
+                    file = max(0, min(7, file))
+                    rank = max(0, min(7, rank))
+                    
+                    # Convert to square index (rank 0 = rank 8 in chess notation)
+                    square_idx = (7 - rank) * 8 + file
+                    
+                    # Assign piece to square (simple assignment - could be improved with Hungarian)
+                    pieces_array[square_idx] = piece
+                    setattr(piece, '_confidence', detection['confidence'])
+                    
+                    square_name = chess.square_name(square_idx)
+                    print(f"✅ Assigned {piece_name} to {square_name} (confidence: {detection['confidence']:.2f})")
+                
+                return pieces_array
+            
+            def _sort_corners_for_perspective(self, corners):
+                """Sort corners for perspective transform: top-left, top-right, bottom-right, bottom-left."""
+                # Find the center point
+                center = np.mean(corners, axis=0)
+                
+                # Sort corners by their position relative to center
+                def get_corner_quadrant(corner):
+                    x, y = corner
+                    cx, cy = center
+                    if x < cx and y < cy:
+                        return 0  # top-left
+                    elif x >= cx and y < cy:
+                        return 1  # top-right
+                    elif x >= cx and y >= cy:
+                        return 2  # bottom-right
+                    else:
+                        return 3  # bottom-left
+                
+                # Group corners by quadrant
+                quadrants = [[] for _ in range(4)]
+                for corner in corners:
+                    quad = get_corner_quadrant(corner)
+                    quadrants[quad].append(corner)
+                
+                # Take the first corner from each quadrant (or center if empty)
+                sorted_corners = []
+                for quad in quadrants:
+                    if quad:
+                        sorted_corners.append(quad[0])
+                    else:
+                        sorted_corners.append(center)  # Fallback
+                
+                return np.array(sorted_corners)
+        
+        return MQTTDebuggingChessRecognizer()
     
     def _encode_image(self, img):
         """Convert numpy array to base64 encoded string."""
@@ -98,9 +318,36 @@ class MQTTChessRecognizer:
         
         return viz
     
-    def _visualize_final_board(self, pieces):
-        """Create a visualization of the final board state."""
-        # Create a chess board visualization
+    def _visualize_final_board(self, pieces=None, fen=None):
+        """Create a visualization of the final board state using chess.svg."""
+        if CHESS_SVG_AVAILABLE and fen:
+            try:
+                # Use chess.svg to generate a proper chess board
+                print(f"🎨 Generating board image from FEN: {fen}")
+                
+                # Create chess board from FEN
+                board = chess.Board(fen)
+                
+                # Generate SVG
+                svg_data = chess.svg.board(board, size=600)
+                
+                # Convert SVG to PNG using cairosvg
+                png_data = cairosvg.svg2png(bytestring=svg_data.encode('utf-8'))
+                
+                # Convert PNG bytes to OpenCV format
+                nparr = np.frombuffer(png_data, np.uint8)
+                board_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                print(f"✅ Generated board image using chess.svg: {board_img.shape}")
+                return board_img
+                
+            except Exception as e:
+                print(f"❌ chess.svg failed: {e}, falling back to custom visualization")
+                # Fall back to custom visualization
+                pass
+        
+        # Fallback: Custom visualization (original code)
+        print("🎨 Using custom board visualization")
         canvas_size = 400
         canvas = np.ones((canvas_size, canvas_size, 3), dtype=np.uint8) * 255
         square_size = canvas_size // 8
@@ -127,32 +374,313 @@ class MQTTChessRecognizer:
             cv2.putText(canvas, rank_label, (8, i * square_size + square_size//2 + 5), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
-        # Draw pieces with Unicode symbols
-        piece_symbols = {
-            'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
-            'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'
-        }
-        
-        for i, piece in enumerate(pieces):
-            if piece is not None:
-                rank = 7 - (i // 8)
-                file = i % 8
-                
-                x = file * square_size + square_size // 2
-                y = rank * square_size + square_size // 2
-                
-                symbol = piece.symbol()
-                unicode_symbol = piece_symbols.get(symbol, symbol)
-                
-                # Use different colors for white/black pieces
-                color = (50, 50, 50) if symbol.isupper() else (150, 50, 50)
-                
-                # Draw the piece with good visibility
-                cv2.putText(canvas, unicode_symbol, (x - 12, y + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 2)
+        # Only draw pieces if we have the pieces array
+        if pieces is not None:
+            # Draw pieces with Unicode symbols
+            piece_symbols = {
+                'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
+                'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'
+            }
+            
+            for i, piece in enumerate(pieces):
+                if piece is not None:
+                    rank = 7 - (i // 8)
+                    file = i % 8
+                    
+                    x = file * square_size + square_size // 2
+                    y = rank * square_size + square_size // 2
+                    
+                    symbol = piece.symbol()
+                    unicode_symbol = piece_symbols.get(symbol, symbol)
+                    
+                    # Use different colors for white/black pieces
+                    color = (50, 50, 50) if symbol.isupper() else (150, 50, 50)
+                    
+                    # Draw the piece with good visibility
+                    cv2.putText(canvas, unicode_symbol, (x - 12, y + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 2)
         
         return canvas
     
-    def process_image(self, image_data, turn=chess.WHITE):
+    def _visualize_yolo_fallback_results(self, img, raw_detections):
+        """Visualize YOLO detection results without board mapping."""
+        viz = img.copy()
+        
+        class_names = [
+            "black_bishop", "black_king", "black_knight", "black_pawn", "black_queen", "black_rook",
+            "white_bishop", "white_king", "white_knight", "white_pawn", "white_queen", "white_rook"
+        ]
+        
+        colors = [
+            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255),
+            (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0), (128, 0, 128), (0, 128, 128)
+        ]
+        
+        for detection in raw_detections:
+            bbox = detection['bbox']
+            confidence = detection['confidence']
+            class_id = detection['class']
+            
+            if class_id < len(class_names):
+                x1, y1, x2, y2 = [int(coord) for coord in bbox]
+                
+                # Draw bounding box
+                color = colors[class_id % len(colors)]
+                cv2.rectangle(viz, (x1, y1), (x2, y2), color, 3)
+                
+                # Draw label with confidence
+                piece_name = class_names[class_id]
+                label = f"{piece_name}: {confidence:.2f}"
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(viz, (x1, y1 - label_size[1] - 10), 
+                            (x1 + label_size[0], y1), color, -1)
+                cv2.putText(viz, label, (x1, y1 - 5), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Add title
+        cv2.putText(viz, f"YOLO Piece Detection: {len(raw_detections)} pieces found", 
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(viz, "(Without board boundaries)", 
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        return viz
+    
+    def _create_piece_summary(self, pieces):
+        """Create a text summary of detected pieces."""
+        piece_counts = {}
+        for piece in pieces:
+            if piece is not None:
+                piece_name = piece.symbol()
+                if piece_name.isupper():
+                    piece_type = f"White {chess.piece_name(piece.piece_type).title()}"
+                else:
+                    piece_type = f"Black {chess.piece_name(piece.piece_type).title()}"
+                piece_counts[piece_type] = piece_counts.get(piece_type, 0) + 1
+        
+        if piece_counts:
+            lines = []
+            for piece_type, count in piece_counts.items():
+                lines.append(f"{piece_type}: {count}")
+            return "\n".join(lines)
+        return ""
+    
+    def _visualize_yolo_raw_detections_on_original(self, img, raw_detections):
+        """Visualize YOLO raw detections with bounding boxes on original image - matches debug webapp 4a."""
+        viz = img.copy()
+        
+        if not raw_detections:
+            # No detections to show
+            cv2.putText(viz, "No YOLO detections found", (10, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+            cv2.putText(viz, "No YOLO detections found", (10, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+            return viz
+        
+        class_names = [
+            "black_bishop", "black_king", "black_knight", "black_pawn", "black_queen", "black_rook",
+            "white_bishop", "white_king", "white_knight", "white_pawn", "white_queen", "white_rook"
+        ]
+        
+        colors = [
+            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255),
+            (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0), (128, 0, 128), (0, 128, 128)
+        ]
+        
+        for detection in raw_detections:
+            bbox = detection['bbox']
+            confidence = detection['confidence']
+            class_id = detection['class']
+            
+            if class_id < len(class_names):
+                x1, y1, x2, y2 = [int(coord) for coord in bbox]
+                
+                # Draw bounding box
+                color = colors[class_id % len(colors)]
+                cv2.rectangle(viz, (x1, y1), (x2, y2), color, 3)
+                
+                # Draw label with confidence
+                piece_name = class_names[class_id]
+                label = f"{piece_name}: {confidence:.2f}"
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                cv2.rectangle(viz, (x1, y1 - label_size[1] - 10), 
+                            (x1 + label_size[0], y1), color, -1)
+                cv2.putText(viz, label, (x1, y1 - 5), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Add title matching debug webapp
+        title = f"Original Image + YOLO Detections ({len(raw_detections)} pieces)"
+        cv2.putText(viz, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 3)
+        cv2.putText(viz, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        return viz
+
+    def _visualize_pieces_on_original(self, img, corners, pieces):
+        """Simple visualization showing corners and piece count on original image."""
+        viz = img.copy()
+        
+        # Draw board boundaries if corners are available
+        if corners is not None:
+            corners_int = corners.astype(int)
+            cv2.polylines(viz, [corners_int.reshape((-1, 1, 2))], True, (0, 255, 0), 3)
+            
+            # Draw corner points
+            for i, corner in enumerate(corners_int):
+                cv2.circle(viz, tuple(corner), 8, (255, 0, 0), 2)
+                cv2.putText(viz, str(i), tuple(corner + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+        
+        # Add simple title overlay
+        num_pieces = len([p for p in pieces if p is not None]) if pieces else 0
+        text = f"Detected: {num_pieces} pieces"
+        cv2.putText(viz, text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+        cv2.putText(viz, text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+        
+        return viz
+    
+    def _run_yolo_fallback(self, img, turn=chess.WHITE):
+        """Run YOLO detection without corner constraints."""
+        try:
+            # Get YOLO model
+            if hasattr(self.recognizer._pieces_model, 'model') and self.recognizer._pieces_model.model is not None:
+                yolo_model = self.recognizer._pieces_model.model
+            else:
+                yolo_model = self.recognizer._pieces_model
+            
+            # Set YOLO parameters with 50% confidence threshold
+            confidence_threshold = 0.5  # Explicitly set to 50%
+            iou_threshold = getattr(self.recognizer._pieces_cfg.YOLO, 'IOU_THRESHOLD', 0.4)
+            
+            print(f"🎯 Using YOLO confidence threshold: {confidence_threshold * 100}%")
+            print("🎯 Using original image approach for maximum quality")
+            
+            # Run YOLO directly on full resolution original image
+            try:
+                # YOLOv8 ultralytics - use original image dimensions
+                results = yolo_model.predict(img, conf=confidence_threshold, iou=iou_threshold)
+                detections = self._parse_ultralytics_results(results[0])
+                print(f"📊 YOLO found {len(detections)} detections on original image")
+            except Exception:
+                try:
+                    # YOLOv5 format
+                    results = yolo_model(img, size=max(img.shape[:2]))  # Use original image size
+                    detections = self._parse_yolov5_results(results)
+                except Exception:
+                    # Custom model - assume it returns tensor
+                    results = yolo_model(torch.from_numpy(img).permute(2, 0, 1).float().unsqueeze(0))
+                    detections = self._parse_custom_results(results, confidence_threshold)
+            
+            # Add class names to raw detections
+            class_names = [
+                "black_bishop", "black_king", "black_knight", "black_pawn", "black_queen", "black_rook",
+                "white_bishop", "white_king", "white_knight", "white_pawn", "white_queen", "white_rook"
+            ]
+            for detection in detections:
+                class_id = detection['class']
+                if class_id < len(class_names):
+                    detection['class_name'] = class_names[class_id]
+            
+            return detections
+            
+        except Exception as e:
+            print(f"❌ YOLO fallback failed: {str(e)}")
+            return []
+    
+    def _parse_ultralytics_results(self, results):
+        """Parse YOLOv8 ultralytics results."""
+        detections = []
+        
+        if results.boxes is not None:
+            boxes = results.boxes.xyxy.cpu().numpy()
+            scores = results.boxes.conf.cpu().numpy()
+            classes = results.boxes.cls.cpu().numpy().astype(int)
+            
+            for i in range(len(boxes)):
+                detections.append({
+                    'bbox': boxes[i],  # [x1, y1, x2, y2]
+                    'confidence': scores[i],
+                    'class': classes[i]
+                })
+        
+        return detections
+    
+    def _parse_yolov5_results(self, results):
+        """Parse YOLOv5 results."""
+        detections = []
+        
+        for detection in results.xyxy[0].cpu().numpy():
+            x1, y1, x2, y2, conf, cls = detection
+            detections.append({
+                'bbox': [x1, y1, x2, y2],
+                'confidence': conf,
+                'class': int(cls)
+            })
+        
+        return detections
+    
+    def _parse_custom_results(self, results, confidence_threshold):
+        """Parse custom model results."""
+        detections = []
+        
+        if len(results.shape) == 3:
+            results = results[0]  # Remove batch dimension
+        
+        # Filter by confidence
+        confident_detections = results[results[:, 4] > confidence_threshold]
+        
+        for detection in confident_detections:
+            x_center, y_center, width, height, conf, cls = detection[:6]
+            
+            # Convert from center format to corner format
+            x1 = float(x_center - width / 2)
+            y1 = float(y_center - height / 2) 
+            x2 = float(x_center + width / 2)
+            y2 = float(y_center + height / 2)
+            
+            detections.append({
+                'bbox': [x1, y1, x2, y2],
+                'confidence': float(conf),
+                'class': int(cls)
+            })
+        
+        return detections
+    
+    def _backup_corner_config(self):
+        """Backup current corner detection config values."""
+        cfg = self.recognizer._corner_detection_cfg
+        return {
+            'edge_low_threshold': cfg.EDGE_DETECTION.LOW_THRESHOLD,
+            'edge_high_threshold': cfg.EDGE_DETECTION.HIGH_THRESHOLD,
+            'line_threshold': cfg.LINE_DETECTION.THRESHOLD,
+            'ransac_offset_tolerance': cfg.RANSAC.OFFSET_TOLERANCE,
+            'ransac_best_solution_tolerance': cfg.RANSAC.BEST_SOLUTION_TOLERANCE
+        }
+    
+    def _apply_corner_params(self, corner_params):
+        """Apply custom corner detection parameters."""
+        cfg = self.recognizer._corner_detection_cfg
+        
+        if 'edge_low_threshold' in corner_params:
+            cfg.EDGE_DETECTION.LOW_THRESHOLD = corner_params['edge_low_threshold']
+        if 'edge_high_threshold' in corner_params:
+            cfg.EDGE_DETECTION.HIGH_THRESHOLD = corner_params['edge_high_threshold']
+        if 'line_threshold' in corner_params:
+            cfg.LINE_DETECTION.THRESHOLD = corner_params['line_threshold']
+        if 'ransac_offset_tolerance' in corner_params:
+            cfg.RANSAC.OFFSET_TOLERANCE = corner_params['ransac_offset_tolerance']
+        if 'ransac_best_solution_tolerance' in corner_params:
+            cfg.RANSAC.BEST_SOLUTION_TOLERANCE = corner_params['ransac_best_solution_tolerance']
+            
+        print(f"🔧 Applied corner detection params: edge_thresholds=({cfg.EDGE_DETECTION.LOW_THRESHOLD}, {cfg.EDGE_DETECTION.HIGH_THRESHOLD}), line_threshold={cfg.LINE_DETECTION.THRESHOLD}")
+    
+    def _restore_corner_config(self, original_config):
+        """Restore original corner detection config values."""
+        if original_config:
+            cfg = self.recognizer._corner_detection_cfg
+            cfg.EDGE_DETECTION.LOW_THRESHOLD = original_config['edge_low_threshold']
+            cfg.EDGE_DETECTION.HIGH_THRESHOLD = original_config['edge_high_threshold']
+            cfg.LINE_DETECTION.THRESHOLD = original_config['line_threshold']
+            cfg.RANSAC.OFFSET_TOLERANCE = original_config['ransac_offset_tolerance']
+            cfg.RANSAC.BEST_SOLUTION_TOLERANCE = original_config['ransac_best_solution_tolerance']
+    
+    def process_image(self, image_data, turn=chess.WHITE, corner_params=None):
         """Process image through chess recognition pipeline."""
         if not self.available:
             return {
@@ -160,6 +688,12 @@ class MQTTChessRecognizer:
                 'error': 'Chess recognition not available',
                 'original_image': f"data:image/jpeg;base64,{image_data}"
             }
+        
+        # Store original config values to restore later
+        original_config = None
+        if corner_params:
+            original_config = self._backup_corner_config()
+            self._apply_corner_params(corner_params)
         
         try:
             # Decode base64 image
@@ -178,27 +712,54 @@ class MQTTChessRecognizer:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             print(f"📐 Image shape: {img.shape}")
             
-            # Run recognition using the same approach as debug_webapp
-            print("♟️ Running full chess recognition...")
+            # Run recognition using the same approach as debug webapp  
+            print("♟️ Running chess recognition with original image approach...")
             with torch.no_grad():
                 try:
-                    # Use the same approach as debug_webapp - just call predict() directly
-                    board, final_corners = self.recognizer.predict(img, turn)
+                    # Use the simplified approach that matches debug webapp
+                    board, final_corners = self.recognizer.predict_simple(img, turn, use_original_image=True)
                     print(f"✅ Recognition successful, board: {board.fen()}")
+                    
+                    # Get raw detections if available
+                    raw_detections = getattr(self.recognizer, '_last_raw_detections', [])
+                    print(f"📊 Captured {len(raw_detections)} raw YOLO detections for visualization")
                     
                     # Create visualizations for the successful recognition
                     # Get the resized image and corners for visualization
                     img_resized, img_scale = resize_image(self.recognizer._corner_detection_cfg, img)
-                    corners = find_corners(self.recognizer._corner_detection_cfg, img_resized)
-                    corners_viz = self._visualize_corners(img_resized, corners)
+                    corners_resized = find_corners(self.recognizer._corner_detection_cfg, img_resized)
+                    corners_viz = self._visualize_corners(img_resized, corners_resized)
                     
-                    # Create board visualization
+                    # Get pieces from board
                     pieces = []
                     for square in self.recognizer._squares:
                         piece = board.piece_at(square)
                         pieces.append(piece)
                     
-                    board_viz = self._visualize_final_board(pieces)
+                    # Create board visualization using chess.svg
+                    board_viz = self._visualize_final_board(pieces, board.fen())
+                    
+                    # For pieces view, show YOLO raw detections on original image (matches debug webapp 4a)
+                    pieces_on_original_viz = self._visualize_yolo_raw_detections_on_original(img, raw_detections)
+                    
+                    # Make raw detections JSON serializable
+                    serializable_detections = []
+                    for det in raw_detections:
+                        det_copy = det.copy()
+                        if 'bbox' in det_copy and hasattr(det_copy['bbox'], 'tolist'):
+                            det_copy['bbox'] = det_copy['bbox'].tolist()
+                        elif 'bbox' in det_copy and isinstance(det_copy['bbox'], np.ndarray):
+                            det_copy['bbox'] = det_copy['bbox'].tolist()
+                        det_copy['confidence'] = float(det_copy['confidence'])
+                        det_copy['class'] = int(det_copy['class'])
+                        # Add class name for better display
+                        class_names = [
+                            "black_bishop", "black_king", "black_knight", "black_pawn", "black_queen", "black_rook",
+                            "white_bishop", "white_king", "white_knight", "white_pawn", "white_queen", "white_rook"
+                        ]
+                        if det_copy['class'] < len(class_names):
+                            det_copy['class_name'] = class_names[det_copy['class']]
+                        serializable_detections.append(det_copy)
                     
                     return {
                         'success': True,
@@ -206,9 +767,11 @@ class MQTTChessRecognizer:
                         'board_unicode': str(board),
                         'piece_count': len([p for p in pieces if p is not None]),
                         'corners': make_json_serializable(final_corners),
+                        'raw_detections': serializable_detections,
                         'images': {
                             'original': f"data:image/jpeg;base64,{image_data}",
                             'corners_detected': self._encode_image(corners_viz),
+                            'pieces_detected': self._encode_image(pieces_on_original_viz),
                             'board_state': self._encode_image(board_viz)
                         }
                     }
@@ -233,7 +796,7 @@ class MQTTChessRecognizer:
                     ]
                     
                     if any(pattern in error_msg for pattern in no_board_patterns):
-                        print(f"📍 Treating as no chess board detected")
+                        print("📍 Treating as no chess board detected")
                         return {
                             'success': False,
                             'error': 'No chess board detected in image',
@@ -255,6 +818,71 @@ class MQTTChessRecognizer:
                 'error': f"Recognition failed: {str(e)}",
                 'original_image': f"data:image/jpeg;base64,{image_data}"
             }
+        finally:
+            # Always restore original config
+            if original_config:
+                self._restore_corner_config(original_config)
+
+    def try_with_adaptive_parameters(self, image_data, turn=chess.WHITE):
+        """Try recognition with original image approach, then fallback if needed."""
+        
+        # Try with default parameters first (no custom params)
+        print("🔄 Attempting recognition with original image approach...")
+        result = self.process_image(image_data, turn, None)
+        
+        if result['success']:
+            print("✅ Recognition successful")
+            return result
+        
+        # If main approach failed, try YOLO fallback 
+        if hasattr(self.recognizer, '_use_yolo') and self.recognizer._use_yolo:
+            print("🔄 Main recognition failed, trying YOLO fallback mode...")
+            
+            # Get the original image
+            img_data = base64.b64decode(image_data)
+            nparr = np.frombuffer(img_data, np.uint8)
+            original_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+            
+            print(f"📐 YOLO fallback using full resolution original image: {original_img.shape}")
+            fallback_detections = self._run_yolo_fallback(original_img, turn)
+            
+            if fallback_detections:
+                print(f"✅ YOLO fallback found {len(fallback_detections)} pieces")
+                fallback_viz = self._visualize_yolo_fallback_results(original_img, fallback_detections)
+                
+                # Ensure detections are JSON serializable
+                serializable_detections = []
+                for det in fallback_detections:
+                    det_copy = det.copy()
+                    if 'bbox' in det_copy and hasattr(det_copy['bbox'], 'tolist'):
+                        det_copy['bbox'] = det_copy['bbox'].tolist()
+                    elif 'bbox' in det_copy and isinstance(det_copy['bbox'], np.ndarray):
+                        det_copy['bbox'] = det_copy['bbox'].tolist()
+                    det_copy['confidence'] = float(det_copy['confidence'])
+                    det_copy['class'] = int(det_copy['class'])
+                    serializable_detections.append(det_copy)
+                
+                return {
+                    'success': True,
+                    'fallback_mode': True,
+                    'piece_count': len(fallback_detections),
+                    'board_fen': None,
+                    'board_unicode': None,
+                    'corners': None,
+                    'raw_detections': serializable_detections,
+                    'images': {
+                        'original': f"data:image/jpeg;base64,{image_data}",
+                        'pieces_detected': self._encode_image(fallback_viz),
+                        'board_state': None,
+                        'corners_detected': None
+                    }
+                }
+            else:
+                print("📍 YOLO fallback found no pieces")
+                
+        print("📍 No chess detection possible")
+        return result
 
 # Global chess recognizer
 chess_recognizer = MQTTChessRecognizer()
@@ -355,10 +983,11 @@ class MQTTHandler:
                     msg_obj['saved_filename'] = filename
                     print(f"Saved image as: {filename}")
                     
-                    # Process through chess recognition pipeline
+                    # Process through chess recognition pipeline with adaptive parameters
                     print("🔍 Processing image through chess recognition...")
-                    recognition_results = chess_recognizer.process_image(data["image"])
-                    msg_obj['recognition_results'] = recognition_results
+                    recognition_results = chess_recognizer.try_with_adaptive_parameters(data["image"])
+                    # Ensure all results are JSON serializable
+                    msg_obj['recognition_results'] = make_json_serializable(recognition_results)
                     
                     if recognition_results['success']:
                         print(f"✅ Chess recognition successful - detected {recognition_results['piece_count']} pieces")
@@ -561,6 +1190,29 @@ def status():
 def get_messages():
     """Get recent messages as JSON."""
     return jsonify(list(message_queue))
+
+@app.route('/test_image', methods=['POST'])
+def test_image_recognition():
+    """Test image recognition with different parameter sets."""
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image file provided'}), 400
+    
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    try:
+        # Convert uploaded file to base64
+        img_data = file.read()
+        image_b64 = base64.b64encode(img_data).decode('utf-8')
+        
+        # Test with adaptive parameters
+        result = chess_recognizer.try_with_adaptive_parameters(image_b64)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'error': f'Test failed: {str(e)}'}), 500
 
 @app.route('/')
 def index():
@@ -775,11 +1427,35 @@ HTML_TEMPLATE = '''
             background: white;
             border: 1px solid #e4e4e7;
             border-radius: 8px;
-            padding: 16px;
+            padding: 12px;
             font-size: 11px;
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
             max-width: 300px;
             z-index: 10;
+            transition: all 0.3s ease;
+        }
+        .board-info.minimized {
+            padding: 8px 12px;
+            max-width: 200px;
+        }
+        .board-info.minimized .expandable-content {
+            display: none;
+        }
+        .info-toggle {
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 4px;
+            border-radius: 4px;
+            color: #71717a;
+            font-size: 12px;
+            transition: all 0.15s ease;
+            float: right;
+            margin-left: 8px;
+        }
+        .info-toggle:hover {
+            background: #f1f5f9;
+            color: #09090b;
         }
         .board-info h4 {
             margin: 0 0 8px 0;
@@ -985,23 +1661,24 @@ HTML_TEMPLATE = '''
         
         <div class="image-panel">
             <div class="image-header">
-                <div class="image-title">Chess Board Analysis</div>
+                <div class="image-title">Chess Piece Analysis</div>
                 <div class="image-controls">
                     <button class="image-tab" onclick="showImageTab('original')">Original</button>
                     <button class="image-tab" onclick="showImageTab('corners')">Corners</button>
-                    <button class="image-tab active" onclick="showImageTab('board')">Board</button>
+                    <button class="image-tab active" onclick="showImageTab('pieces')">Pieces</button>
+                    <button class="image-tab" onclick="showImageTab('board')">Board</button>
                 </div>
             </div>
             <div class="image-content">
                 <div id="latest-image-container">
                     <div class="no-image">
-                        <div style="font-size: 48px; margin-bottom: 16px;">♟️</div>
-                        <div style="font-weight: 600; color: #09090b; margin-bottom: 8px;">Chess Board Analysis</div>
+                        <div style="font-size: 48px; margin-bottom: 16px;">🔍</div>
+                        <div style="font-weight: 600; color: #09090b; margin-bottom: 8px;">Piece Detection</div>
                         <div>Waiting for images to analyze...</div>
                     </div>
                 </div>
                 <div id="image-info" class="image-info" style="display: none;"></div>
-                <div id="board-info" class="board-info" style="display: none;"></div>
+                <div id="board-info" class="board-info minimized" style="display: none;"></div>
             </div>
         </div>
     </div>
@@ -1010,8 +1687,9 @@ HTML_TEMPLATE = '''
         let autoScrollEnabled = true;
         let messageCount = 0;
         let latestImageData = null;
-        let currentImageTab = 'board';  // Default to board view
+        let currentImageTab = 'pieces';  // Default to pieces view
         let recognitionResults = null;
+        let analysisMinimized = true;  // Start with minimized analysis panel
         
         // Update status
         function updateStatus() {
@@ -1093,9 +1771,19 @@ HTML_TEMPLATE = '''
                 
                 if (data.recognition_results) {
                     if (data.recognition_results.success) {
-                        title = 'Chess Board Analyzed';
-                        iconClass = 'icon-camera';
-                        description = `${filename} • ${data.recognition_results.piece_count} pieces detected`;
+                        if (data.recognition_results.fallback_mode) {
+                            title = 'Pieces Detected';
+                            iconClass = 'icon-chess';
+                            description = `${filename} • ${data.recognition_results.piece_count} pieces found (YOLO detections)`;
+                        } else {
+                            title = 'Chess Board Analyzed';
+                            iconClass = 'icon-camera';
+                            let adaptiveNote = '';
+                            if (data.recognition_results.parameter_set && data.recognition_results.parameter_set > 1) {
+                                adaptiveNote = ' (adaptive)';
+                            }
+                            description = `${filename} • ${data.recognition_results.piece_count} pieces detected${adaptiveNote}`;
+                        }
                     } else if (data.recognition_results.error_type === 'no_board') {
                         title = 'Image Received';
                         iconClass = 'icon-info';
@@ -1221,11 +1909,53 @@ HTML_TEMPLATE = '''
                         imageSource = recognitionResults.images.original;
                         break;
                     case 'corners':
-                        imageSource = recognitionResults.images.corners_detected;
+                        if (recognitionResults.fallback_mode) {
+                            // No corners available in fallback mode
+                            imageContainer.innerHTML = `
+                                <div style="position: relative; display: inline-block;">
+                                    <img src="${recognitionResults.images.original}" alt="Original Image" class="latest-image" style="opacity: 0.7;" />
+                                    <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(239, 68, 68, 0.9); color: white; padding: 16px 24px; border-radius: 8px; text-align: center; backdrop-filter: blur(4px);">
+                                        <div style="font-size: 20px; margin-bottom: 4px;">⚠️</div>
+                                        <div style="font-weight: 600; margin-bottom: 4px;">No Corners Detected</div>
+                                        <div style="font-size: 12px;">Using YOLO fallback mode</div>
+                                    </div>
+                                </div>
+                            `;
+                            updateBoardInfo(false);
+                            return;
+                        } else {
+                            imageSource = recognitionResults.images.corners_detected;
+                        }
+                        break;
+                    case 'pieces':
+                        if (recognitionResults.fallback_mode) {
+                            imageSource = recognitionResults.images.pieces_detected;
+                            showBoardInfo = true; // Show piece info for fallback mode
+                        } else {
+                            // For normal mode, show pieces on original image
+                            imageSource = recognitionResults.images.pieces_detected || recognitionResults.images.corners_detected;
+                            showBoardInfo = true; // Show board info in pieces tab
+                        }
                         break;
                     case 'board':
-                        imageSource = recognitionResults.images.board_state;
-                        showBoardInfo = true;
+                        if (recognitionResults.fallback_mode) {
+                            // No board state available in fallback mode
+                            imageContainer.innerHTML = `
+                                <div class="no-image">
+                                    <div style="text-align: center; color: #71717a; font-size: 16px; margin-bottom: 16px;">
+                                        <div style="font-size: 48px; margin-bottom: 12px;">⚠️</div>
+                                        <div style="font-weight: 600; color: #09090b; margin-bottom: 8px;">No Board State Available</div>
+                                        <div>Pieces detected but board position unknown</div>
+                                        <div style="margin-top: 12px; font-size: 14px;">Switch to "Pieces" tab to see detections</div>
+                                    </div>
+                                </div>
+                            `;
+                            updateBoardInfo(false);
+                            return;
+                        } else {
+                            imageSource = recognitionResults.images.board_state;
+                            showBoardInfo = true;
+                        }
                         break;
                     default:
                         imageSource = recognitionResults.images.original;
@@ -1288,21 +2018,92 @@ HTML_TEMPLATE = '''
             updateBoardInfo(showBoardInfo);
         }
         
+        function toggleAnalysisInfo() {
+            analysisMinimized = !analysisMinimized;
+            const boardInfo = document.getElementById('board-info');
+            
+            if (analysisMinimized) {
+                boardInfo.classList.add('minimized');
+            } else {
+                boardInfo.classList.remove('minimized');
+            }
+            
+            // Update toggle button icon
+            const toggleBtn = boardInfo.querySelector('.info-toggle');
+            if (toggleBtn) {
+                toggleBtn.textContent = analysisMinimized ? '📊' : '📉';
+            }
+        }
+        
+        // Make toggleAnalysisInfo available globally
+        window.toggleAnalysisInfo = toggleAnalysisInfo;
+
         function updateBoardInfo(show) {
             const boardInfo = document.getElementById('board-info');
             
             if (show && recognitionResults && recognitionResults.success) {
-                boardInfo.innerHTML = `
-                    <h4>Analysis Results</h4>
-                    <div class="stats">
-                        <span><strong>Pieces:</strong> ${recognitionResults.piece_count}</span>
-                        <span><strong>Status:</strong> Valid Board</span>
-                    </div>
-                    <div class="fen">
-                        <strong>FEN:</strong><br>
-                        ${recognitionResults.board_fen}
-                    </div>
-                `;
+                const toggleButton = `<button class="info-toggle" onclick="toggleAnalysisInfo()">${analysisMinimized ? '📊' : '📉'}</button>`;
+                
+                if (recognitionResults.fallback_mode) {
+                    // Show piece detection results for fallback mode
+                    const detectedPieces = recognitionResults.raw_detections || [];
+                    const piecesList = detectedPieces.map(det => 
+                        `<span style="display: inline-block; background: #e9ecef; padding: 4px 8px; margin: 2px; border-radius: 3px; font-size: 10px;">${det.class_name}: ${det.confidence.toFixed(2)}</span>`
+                    ).join('');
+                    
+                    boardInfo.innerHTML = `
+                        <h4>Detections ${toggleButton}</h4>
+                        <div class="stats">
+                            <span><strong>${recognitionResults.piece_count}</strong> pieces found</span>
+                        </div>
+                        <div class="expandable-content">
+                            <div style="margin-top: 8px; max-height: 120px; overflow-y: auto;">
+                                <strong>Detected Pieces:</strong><br>
+                                ${piecesList}
+                            </div>
+                            <div style="margin-top: 8px; font-size: 9px; color: #71717a; font-style: italic;">
+                                Note: Board position unknown without corner detection
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    // Show full board analysis for normal mode
+                    let detectionInfo = '';
+                    if (recognitionResults.raw_detections && recognitionResults.raw_detections.length > 0) {
+                        const detections = recognitionResults.raw_detections.slice(0, 6); // Show fewer in minimized
+                        detectionInfo = `
+                            <div style="margin-top: 8px; max-height: 120px; overflow-y: auto;">
+                                <strong>YOLO Detections:</strong><br>
+                                ${detections.map(det => 
+                                    `<span style="display: inline-block; background: #e9ecef; padding: 4px 8px; margin: 2px; border-radius: 3px; font-size: 10px;">${det.class_name}: ${det.confidence.toFixed(2)}</span>`
+                                ).join('')}
+                                ${recognitionResults.raw_detections.length > 6 ? `<br><span style="font-size: 9px; color: #71717a;">...and ${recognitionResults.raw_detections.length - 6} more</span>` : ''}
+                            </div>
+                        `;
+                    }
+                    
+                    boardInfo.innerHTML = `
+                        <h4>Analysis ${toggleButton}</h4>
+                        <div class="stats">
+                            <span><strong>${recognitionResults.piece_count}</strong> pieces detected</span>
+                        </div>
+                        <div class="expandable-content">
+                            <div class="fen">
+                                <strong>FEN:</strong><br>
+                                ${recognitionResults.board_fen}
+                            </div>
+                            ${detectionInfo}
+                        </div>
+                    `;
+                }
+                
+                // Apply minimized state
+                if (analysisMinimized) {
+                    boardInfo.classList.add('minimized');
+                } else {
+                    boardInfo.classList.remove('minimized');
+                }
+                
                 boardInfo.style.display = 'block';
             } else {
                 boardInfo.style.display = 'none';
@@ -1315,6 +2116,9 @@ HTML_TEMPLATE = '''
             if (data.image_data) {
                 latestImageData = data;
                 recognitionResults = data.recognition_results || null;
+                
+                // Reset to minimized state for new images
+                analysisMinimized = true;
                 
                 // Update image display based on current tab
                 updateImageDisplay();
@@ -1330,8 +2134,17 @@ HTML_TEMPLATE = '''
                 
                 if (recognitionResults) {
                     if (recognitionResults.success) {
-                        infoContent += `<br><span style="color: #22c55e;">✓ Chess board detected</span>`;
-                        infoContent += `<br><span style="color: #22c55e;">${recognitionResults.piece_count} pieces found</span>`;
+                        if (recognitionResults.fallback_mode) {
+                            infoContent += `<br><span style="color: #22c55e;">✓ Pieces detected</span>`;
+                            infoContent += `<br><span style="color: #f59e0b;">⚠ No board boundaries</span>`;
+                            infoContent += `<br><span style="color: #22c55e;">${recognitionResults.piece_count} pieces found</span>`;
+                        } else {
+                            infoContent += `<br><span style="color: #22c55e;">✓ Chess board detected</span>`;
+                            infoContent += `<br><span style="color: #22c55e;">${recognitionResults.piece_count} pieces found</span>`;
+                            if (recognitionResults.parameter_set && recognitionResults.parameter_set > 1) {
+                                infoContent += `<br><span style="color: #06b6d4;">🔧 Used adaptive parameters</span>`;
+                            }
+                        }
                     } else if (recognitionResults.error_type === 'no_board') {
                         infoContent += `<br><span style="color: #f59e0b;">ℹ No chess board in image</span>`;
                     } else {
