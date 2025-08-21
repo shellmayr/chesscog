@@ -292,7 +292,7 @@ class MQTTChessRecognizer:
         return MQTTDebuggingChessRecognizer()
     
     def _rotate_board_for_camera(self, board):
-        """Rotate a chess board 180° to match camera orientation."""
+        """Rotate a chess board 90° clockwise to match camera orientation."""
         # Create new board
         rotated_board = chess.Board()
         rotated_board.clear_board()
@@ -304,10 +304,10 @@ class MQTTChessRecognizer:
                 file = chess.square_file(square)  # 0-7 (a-h)
                 rank = chess.square_rank(square)  # 0-7 (1-8)
                 
-                # 180 degrees rotation: (file, rank) -> (7-file, 7-rank)
-                # This moves queen from g1 (6,0) to b8 (1,7) as requested
-                new_file = 7 - file
-                new_rank = 7 - rank
+                # 90 degrees clockwise: (file, rank) -> (rank, 7-file)
+                # This is 180° - 90° = 90° total from original orientation
+                new_file = rank
+                new_rank = 7 - file
                 
                 new_square = chess.square(new_file, new_rank)
                 rotated_board.set_piece_at(new_square, piece)
@@ -743,10 +743,10 @@ class MQTTChessRecognizer:
                     board, final_corners = self.recognizer.predict_simple(img, turn, use_original_image=True)
                     print(f"✅ Recognition successful, board: {board.fen()}")
                     
-                    # Rotate board to match camera orientation (180°)
+                    # Rotate board to match camera orientation (90° clockwise)
                     if ROTATE_BOARD_270:
                         rotated_board = self._rotate_board_for_camera(board)
-                        print(f"🔄 Rotated board 180° for camera view: {rotated_board.fen()}")
+                        print(f"🔄 Rotated board 90° clockwise for camera view: {rotated_board.fen()}")
                     else:
                         rotated_board = board
                         print(f"📋 Using original board orientation: {board.fen()}")
@@ -929,7 +929,7 @@ MQTT_PASSWORD = os.getenv('MQTT_PASSWORD')
 MQTT_TOPIC = os.getenv('MQTT_TOPIC', '/hypervision/forka/device/10:51:DB:85:4B:B0/feed')
 MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'chess_mqtt_webapp_client')
 
-# Board rotation settings for camera orientation (180°)
+# Board rotation settings for camera orientation (90° clockwise)
 ROTATE_BOARD_270 = os.getenv('ROTATE_BOARD_270', 'true').lower() == 'true'
 
 # Message storage for live updates
@@ -1026,7 +1026,7 @@ class MQTTHandler:
                     
                     if recognition_results['success']:
                         print(f"✅ Chess recognition successful - detected {recognition_results['piece_count']} pieces")
-                        print(f"📋 Rotated Board FEN (180°): {recognition_results['board_fen']}")
+                        print(f"📋 Rotated Board FEN (90° clockwise): {recognition_results['board_fen']}")
                         if 'original_fen' in recognition_results:
                             print(f"📋 Original FEN: {recognition_results['original_fen']}")
                     else:
@@ -1819,7 +1819,7 @@ HTML_TEMPLATE = '''
                             if (data.recognition_results.parameter_set && data.recognition_results.parameter_set > 1) {
                                 adaptiveNote = ' (adaptive)';
                             }
-                            const rotationNote = (data.recognition_results.original_fen && data.recognition_results.original_fen !== data.recognition_results.board_fen) ? ' (180° rotated)' : '';
+                            const rotationNote = (data.recognition_results.original_fen && data.recognition_results.original_fen !== data.recognition_results.board_fen) ? ' (90° rotated)' : '';
                             description = `${filename} • ${data.recognition_results.piece_count} pieces detected${rotationNote}${adaptiveNote}`;
                         }
                     } else if (data.recognition_results.error_type === 'no_board') {
@@ -2124,7 +2124,7 @@ HTML_TEMPLATE = '''
                         <h4>Analysis ${toggleButton}</h4>
                         <div class="stats">
                             <span><strong>${recognitionResults.piece_count}</strong> pieces detected</span>
-                            ${recognitionResults.original_fen && recognitionResults.original_fen !== recognitionResults.board_fen ? '<span><strong>180° rotated</strong></span>' : ''}
+                            ${recognitionResults.original_fen && recognitionResults.original_fen !== recognitionResults.board_fen ? '<span><strong>90° rotated</strong></span>' : ''}
                         </div>
                         <div class="expandable-content">
                             <div class="fen">
@@ -2182,7 +2182,7 @@ HTML_TEMPLATE = '''
                             infoContent += `<br><span style="color: #22c55e;">✓ Chess board detected</span>`;
                             infoContent += `<br><span style="color: #22c55e;">${recognitionResults.piece_count} pieces found</span>`;
                             if (recognitionResults.original_fen && recognitionResults.original_fen !== recognitionResults.board_fen) {
-                                infoContent += `<br><span style="color: #7c3aed;">🔄 Rotated 180° for camera</span>`;
+                                infoContent += `<br><span style="color: #7c3aed;">🔄 Rotated 90° for camera</span>`;
                             }
                             if (recognitionResults.parameter_set && recognitionResults.parameter_set > 1) {
                                 infoContent += `<br><span style="color: #06b6d4;">🔧 Used adaptive parameters</span>`;

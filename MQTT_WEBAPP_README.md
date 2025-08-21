@@ -31,7 +31,7 @@ MQTT_USERNAME=your_username
 MQTT_PASSWORD=your_password  
 MQTT_TOPIC=your_topic
 # Board rotation for camera orientation  
-ROTATE_BOARD_270=true  # Actually applies 180° rotation
+ROTATE_BOARD_270=true  # Actually applies 90° clockwise rotation
 # ... other MQTT settings
 ```
 
@@ -114,31 +114,31 @@ For YOLO-based piece recognition, the webapp uses the **"Use Original Image"** a
 - Runs YOLO detection on full-resolution original image
 - **Uses perspective transformation** to map detections to chess squares accurately
 - **Corner-based mapping** instead of flawed auto-detection from piece positions
-- **Automatic 180° rotation** for camera orientation
+- **Automatic 90° clockwise rotation** for camera orientation
 - Inspired by approaches from [chess_state_recognition](https://github.com/sta314/chess_state_recognition#) project
 
 ### Board Rotation for Camera Orientation
 
-The webapp automatically rotates the detected board state by **180°** to match camera orientations.
+The webapp automatically rotates the detected board state by **90° clockwise** to match camera orientations.
 
 **Configuration:**
 ```env
-ROTATE_BOARD_270=true   # Enable 180° rotation (default)
+ROTATE_BOARD_270=true   # Enable 90° clockwise rotation (default)
 ROTATE_BOARD_270=false  # Disable rotation
 ```
 
 **How it works:**
 - **Original Detection**: YOLO detects pieces based on camera perspective
 - **Perspective Mapping**: Maps pieces to chess squares using corner detection
-- **180° Rotation**: Rotates the entire board state to match logical chess orientation
+- **90° Clockwise Rotation**: Rotates the entire board state to match logical chess orientation
 - **Final FEN**: Outputs the rotated board state for correct chess notation
 
-**Rotation Formula:** `(file, rank) → (7-file, 7-rank)`
-- Example: Queen at g1 → Queen at b8 after rotation
+**Rotation Formula:** `(file, rank) → (rank, 7-file)`
+- Example: Queen at g1 → Queen at a7 after 90° clockwise rotation
 
 **UI Indicators:**
-- **Activity Feed**: Shows "(180° rotated)" in detection messages
-- **Info Overlay**: Displays "🔄 Rotated 180° for camera" status  
+- **Activity Feed**: Shows "(90° rotated)" in detection messages
+- **Info Overlay**: Displays "🔄 Rotated 90° for camera" status  
 - **Analysis Panel**: Shows both rotated and original FEN for debugging
 
 ### Testing with Sample Messages
